@@ -69,13 +69,13 @@ object RichLocation {
 
   private val callbacks = new CallbackManager[AnyRef, LocationResult]
 
-  trait NotifyUsingCallbacksField {
+  private trait NotifyUsingCallbacksField {
     def notifyFn(l: LocationResult) = callbacks.execute(l)
   }
 
-  def createNotifyingListener = new BaseLocationListener with NotifyingLocationListener with NotifyUsingCallbacksField
+  private def createNotifyingListener = new BaseLocationListener with NotifyingLocationListener with NotifyUsingCallbacksField
 
-  def createLimitedListener(locationManager: LocationManager, nExecutions: Int) = {
+  private def createLimitedListener(locationManager: LocationManager, nExecutions: Int) = {
     var innerListener = new AtomicReference[LocationListener]
     var count = new AtomicInteger(0)
     var result = new BaseLocationListener with NotifyingLocationListener with NotifyUsingCallbacksField {
@@ -115,4 +115,14 @@ object RichLocation {
         true
     }
   }
+  
+  def addListener(owner: AnyRef, fn: LocationResult => Unit) = {
+    callbacks.add(owner, CallbackElementFunctionWithArgument(fn))
+  }
+  def addListener(owner: AnyRef, fn: CallbackManager.CallbackWithArgument[LocationResult]) = {
+    callbacks.add(owner, CallbackElementWithCustomCallback(fn))
+  }
+  def removeListeners(owner: AnyRef) = callbacks.remove(owner)
+  def removeListener(owner: AnyRef, c: CallbackElement[LocationResult]) = callbacks.remove(owner, c)
 }
+
