@@ -1,11 +1,19 @@
 package com.restphone.sga
 
-import android.location._
-import scala.collection.JavaConversions._
-import scala.collection.mutable.SynchronizedQueue
-import android.os.Looper
+import scala.Option.option2Iterable
+import scala.PartialFunction.condOpt
+import scala.collection.JavaConversions.asScalaBuffer
+import android.content.Context
+import android.location.Criteria
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
+import android.location.LocationProvider
 import android.os.Bundle
-import scala.PartialFunction._
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicInteger
+import scala.collection.mutable
+import scala.collection.mutable.SynchronizedSet
 
 sealed abstract class LocationResult
 case class LocationMessage(location: Location) extends LocationResult
@@ -14,51 +22,30 @@ case class LocationDisabled(provider: String) extends LocationResult
 case class OutOfService(provider: String) extends LocationResult
 case class Available(provider: String) extends LocationResult
 case class TemporarilyUnavailable(provider: String) extends LocationResult
-case class Power extends LocationResult
-
-trait TurnLocationIntentsIntoLocationMessages {
-
-}
-
-class SynchronizedQueueWithChangeNotification[T](notify: SynchronizedQueueWithChangeNotification[T] => Unit) extends SynchronizedQueue[T] {
-  val queue = new SynchronizedQueue[T]
-  
-  override def enqueue(p: T*) = {
-    queue.enqueue(p:_*)
-    notify(this)
-  }
-
-  override def dequeue = {
-    val result = queue.dequeue
-    notify(this)
-    result
-  }
-} 
+case object Power extends LocationResult
 
 object RichLocation {
-  val queue = new SynchronizedQueueWithChangeNotification[LocationResult](x => println("hello"))
-
   def getLastKnownLocations(manager: LocationManager): Iterable[LocationResult] =
     for {
       provider <- manager.getAllProviders
       location <- Option(manager.getLastKnownLocation(provider))
     } yield LocationMessage(location)
 
-  trait EnqueueingLocationListener extends LocationListener {
-    val q: SynchronizedQueueWithChangeNotification[LocationResult]
+  abstract trait NotifyingLocationListener extends LocationListener {
+    def notifyFn(l: LocationResult)
 
     abstract override def onLocationChanged(l: Location) = {
-      q.enqueue(LocationMessage(l))
+      notifyFn(LocationMessage(l))
       super.onLocationChanged(l)
     }
 
     abstract override def onProviderDisabled(provider: String) = {
-      q.enqueue(LocationDisabled(provider))
+      notifyFn(LocationDisabled(provider))
       super.onProviderDisabled(provider)
     }
 
     abstract override def onProviderEnabled(provider: String) = {
-      q.enqueue(LocationEnabled(provider))
+      notifyFn(LocationEnabled(provider))
       super.onProviderEnabled(provider)
     }
 
@@ -67,52 +54,65 @@ object RichLocation {
         case LocationProvider.OUT_OF_SERVICE => OutOfService(provider)
         case LocationProvider.AVAILABLE => Available(provider)
         case LocationProvider.TEMPORARILY_UNAVAILABLE => TemporarilyUnavailable(provider)
-      } foreach {q.enqueue(_)}
-      
+      } foreach { notifyFn(_) }
+
       super.onStatusChanged(provider, status, extras)
     }
   }
 
-  trait NotifyingLocationListener extends LocationListener {
-    val notifyFn : () => Unit
-    
-    abstract override def onLocationChanged(l: Location) = {
-      notifyFn()
-      super.onLocationChanged(l)
-    }
-
-    abstract override def onProviderDisabled(provider: String) = {
-      notifyFn()
-      super.onProviderDisabled(provider)
-    }
-
-    abstract override def onProviderEnabled(provider: String) = {
-      notifyFn()
-      super.onProviderEnabled(provider)
-    }
-
-    abstract override def onStatusChanged(provider: String, status: Int, extras: Bundle) = {
-      notifyFn()
-      super.onStatusChanged(provider, status, extras)
-    }
-  }
-
-  class DefaultLocationListener extends LocationListener {
+  class BaseLocationListener extends LocationListener {
     override def onLocationChanged(l: Location) {}
     override def onProviderDisabled(provider: String) {}
     override def onProviderEnabled(provider: String) {}
     override def onStatusChanged(provider: String, status: Int, extras: Bundle) {}
   }
 
-  def createListener(q: SynchronizedQueueWithChangeNotification[LocationResult]) = new DefaultLocationListener with NotifyingLocationListener with EnqueueingLocationListener {
-    val q = queue
-    val notifyFn = () => {println("got something")}
+  private val callbacks = new CallbackManager[AnyRef, LocationResult]
+
+  trait NotifyUsingCallbacksField {
+    def notifyFn(l: LocationResult) = callbacks.execute(l)
   }
 
-  def enqueueSingleLocation(locationManager: LocationManager, criteria: Criteria, looper: Looper) {
+  def createNotifyingListener = new BaseLocationListener with NotifyingLocationListener with NotifyUsingCallbacksField
+
+  def createLimitedListener(locationManager: LocationManager, nExecutions: Int) = {
+    var innerListener = new AtomicReference[LocationListener]
+    var count = new AtomicInteger(0)
+    var result = new BaseLocationListener with NotifyingLocationListener with NotifyUsingCallbacksField {
+      override def notifyFn(l: LocationResult) = {
+        super.notifyFn(l)
+        l match {
+          case LocationMessage(_) =>
+            if (count.incrementAndGet >= nExecutions) locationManager.removeUpdates(innerListener.get)
+          case _ =>
+        }
+      }
+    }
+    innerListener.set(result)
+    result
+  }
+
+  def fetchSingleLocation(locationManager: LocationManager, criteria: Criteria, context: Context) {
     Option(locationManager.getBestProvider(criteria, true)) foreach {
-      x => locationManager.requestLocationUpdates(x, 0, 0, createListener(queue), looper);
+      locationManager.requestLocationUpdates(_, 0, 0, createLimitedListener(locationManager, 1), context.getMainLooper());
+    }
+  }
+
+  val currentFetchers = new mutable.SynchronizedQueue[LocationListener]
+
+  def startFetchingLocations(locationManager: LocationManager, criteria: Criteria, context: Context) {
+    locationManager.getAllProviders.foreach {
+      val listener = createNotifyingListener
+      provider => locationManager.requestLocationUpdates(provider, 0, 0, listener, context.getMainLooper)
+      currentFetchers += listener
+    }
+  }
+
+  def stopFetchingLocations(locationManager: LocationManager, context: Context) {
+    currentFetchers dequeueAll {
+      x =>
+        locationManager.removeUpdates(x)
+        true
     }
   }
 }
-
