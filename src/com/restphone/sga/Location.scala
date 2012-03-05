@@ -16,6 +16,8 @@ import scala.collection.mutable
 import scala.collection.mutable.SynchronizedSet
 import java.util.concurrent.atomic.AtomicLong
 import scala.collection.mutable.SynchronizedMap
+import android.app.Activity
+import android.support.v4.app.Fragment
 
 object LocationPilothouse {
   import LocationPilothouseSupport._
@@ -35,16 +37,45 @@ object LocationPilothouse {
   case object ExistingUpdates extends UpdateFrequencySpec
   case object NoUpdates extends UpdateFrequencySpec
 
-  val frequencyRequests = new mutable.WeakHashMap[AnyRef, UpdateFrequencySpec]() with SynchronizedMap[AnyRef, UpdateFrequencySpec]
+  trait StartLocationFeed {
+    def locationFeedActivity: Activity
+    def locationFeedLocationManager: LocationManager = locationFeedActivity.getSystemService(Context.LOCATION_SERVICE).asInstanceOf[LocationManager]
+    def locationFeedApplicationContext: Context = locationFeedActivity.getApplicationContext
+    def baseOnResume = LocationPilothouse.startFetchingLocations(locationFeedLocationManager,
+      locationFeedApplicationContext, 0);
+    def baseOnPause = {}
+  }
+
+  trait StartLocationFeedForActivity extends Activity with StartLocationFeed {
+    def locationFeedActivity = this
+    abstract override def onResume = { baseOnResume; super.onResume }
+    abstract override def onPause = { baseOnPause; super.onPause }
+  }
+
+  trait StartLocationFeedForFragment extends Fragment with StartLocationFeed {
+    def locationFeedActivity = getActivity
+    abstract override def onResume = { baseOnResume; super.onResume }
+    abstract override def onPause = { baseOnPause; super.onPause }
+  }
+
+  private val frequencyRequests = new mutable.WeakHashMap[AnyRef, UpdateFrequencySpec]() with SynchronizedMap[AnyRef, UpdateFrequencySpec]
 
   def requestUpdateFrequency(owner: AnyRef, frequency: UpdateFrequencySpec) = {
     frequencyRequests.put(owner, frequency)
   }
 
+  /**
+   * Notice that there's a difference between listeners and callbacks.  Listeners are hooked up to
+   * location manager updates, and they forward location events to callbacks.
+   * Callbacks aren't affected by this method.
+   * @param locationManager
+   * @param context
+   * @param minTime
+   */
   def resetRequestedUpdates(locationManager: LocationManager, context: Context, minTime: Long) = {
     stopUpdateAndRemoveFromQueueAllListeners
 
-    val currentFrequencyRequest = {
+    val shortestActiveFrequencyRequest = {
       val items = frequencyRequests.values.toSet
       val intervals = items.toList flatMap {
         case ActiveUpdates(i) => Some(i)
@@ -55,19 +86,24 @@ object LocationPilothouse {
         case _ => None
       }
     }
-    currentFrequencyRequest foreach { i => startFetchingLocations(locationManager, context, minTime) }
+    shortestActiveFrequencyRequest foreach { i => startFetchingLocations(locationManager, context, minTime) }
 
     frequencyRequests.values.toSet.foreach {
       (x: UpdateFrequencySpec) =>
-        (x, currentFrequencyRequest) match {
-          case (PassiveUpdates, Some(interval)) if interval < 1000 => // Do nothing, since we're asking for active updates as often as possible
-          case (PassiveUpdates, None) =>
+        (x, shortestActiveFrequencyRequest) match {
+          case (PassiveUpdates, Some(interval)) if interval <= 2000 =>
+          // Do nothing, since we're asking for active updates fairly often
+
+          case (PassiveUpdates, _) =>
             val listener = createNotifyingListener(locationManager)
             requestLocationUpdatesAndAddToQueue(locationManager, android.location.LocationManager.PASSIVE_PROVIDER, listener, context, minTime)
+
           case (ExistingUpdates, _) =>
             getLastKnownLocations(locationManager) foreach callbacks.execute
 
-          case (ActiveUpdates(_), _) => // Already handled by currentFrequencyRequest
+          case (ActiveUpdates(_), _) =>
+          // Already handled by currentFrequencyRequest
+
           case (NoUpdates, _) =>
         }
     }
@@ -81,6 +117,25 @@ object LocationPilothouse {
 
   private trait NotifyUsingCallbacksField {
     def notifyFn(l: LocationEvent) = callbacks.execute(l)
+  }
+
+  private trait EatDuplicateNotifications extends HasNotifyWithLocation {
+    private def locationsMatch(a: Location, b: Location) =
+      a.getTime == b.getTime && a.getProvider == b.getProvider
+
+    private var eatDuplicateNotificationsPreviousNotification: Option[LocationEvent] = None
+
+    abstract override def notifyFn(l: LocationEvent) = {
+      (eatDuplicateNotificationsPreviousNotification, l) match {
+        case (Some(LocationMessage(previousLocation)), LocationMessage(newLocation)) if locationsMatch(previousLocation, newLocation) =>
+        // Do nothing.  We've got a duplicate message
+        case (_, LocationMessage(_)) =>
+          eatDuplicateNotificationsPreviousNotification = Some(l)
+          super.notifyFn(l)
+        case _ =>
+          super.notifyFn(l)
+      }
+    }
   }
 
   trait HasShouldBeRemovedMethod {
@@ -110,7 +165,7 @@ object LocationPilothouse {
   private val callbacks = new CallbackManager[AnyRef, LocationEvent]
 
   private def createNotifyingListener(lm: LocationManager): LocationListenerWithLocationManager =
-    new BaseLocationListener with NotifyingLocationListener with NotifyUsingCallbacksField with RemoveAfterNCalls with LocationListenerWithLocationManager {
+    new BaseLocationListener with NotifyingLocationListener with NotifyUsingCallbacksField with RemoveAfterNCalls with EatDuplicateNotifications with LocationListenerWithLocationManager {
       override val locationManager = lm
     }
 
@@ -190,12 +245,14 @@ private object LocationPilothouseSupport {
     def locationManager: LocationManager
   }
 
+  trait HasNotifyWithLocation {
+    def notifyFn(l: LocationEvent)
+  }
+
   /**
    * Calls notifyFn on calls to the methods of LocationListener
    */
-  abstract trait NotifyingLocationListener extends LocationListener {
-    def notifyFn(l: LocationEvent)
-
+  abstract trait NotifyingLocationListener extends LocationListener with HasNotifyWithLocation {
     abstract override def onLocationChanged(l: Location) = {
       notifyFn(LocationMessage(l))
       super.onLocationChanged(l)
@@ -230,4 +287,6 @@ private object LocationPilothouseSupport {
   }
 
   val returnTrue = (x: Unit) => true
+
+  val t = Some("ab") filter { s => s forall { _ != ' ' } }
 }
