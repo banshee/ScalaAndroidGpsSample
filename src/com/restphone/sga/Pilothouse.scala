@@ -15,6 +15,7 @@ case class CallbackElementRunnable[T](x: Runnable) extends CallbackElement[T]
 case class CallbackElementCallable[T](x: Callable[T]) extends CallbackElement[T]
 case class CallbackElementWithCustomCallback[T](x: CallbackManager.CallbackWithArgument[T]) extends CallbackElement[T]
 
+
 object CallbackManager {
   trait CallbackWithArgument[T] {
     def callback(x: T)

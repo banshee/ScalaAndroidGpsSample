@@ -12,9 +12,8 @@ trait StartLocationFeed {
   def locationFeedActivity: Activity
   def locationFeedLocationManager: LocationManager = locationFeedActivity.getSystemService(Context.LOCATION_SERVICE).asInstanceOf[LocationManager]
   def locationFeedApplicationContext: Context = locationFeedActivity.getApplicationContext
-  def baseOnResume = RichLocation.startFetchingLocations(locationFeedLocationManager,
-    null,
-    locationFeedApplicationContext);
+  def baseOnResume = LocationPilothouse.startFetchingLocations(locationFeedLocationManager,
+    locationFeedApplicationContext, 1000);
   def baseOnPause = {}
 }
 
@@ -36,7 +35,7 @@ class Fnx extends Fragment with StartLocationFeedForFragment {
 class ScalaGpsAndroidActivity extends FragmentActivity with StartLocationFeedForActivity {
   override def onCreate(savedInstanceState: Bundle) = {
     super.onCreate(savedInstanceState)
-    RichLocation.addListener(this, x => System.out.println("out3: " + x))
+    LocationPilothouse.addListener(this, x => System.out.println("out3: " + x))
     setContentView(R.layout.main)
   }
 }
