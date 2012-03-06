@@ -20,8 +20,6 @@ import android.app.Activity
 import android.support.v4.app.Fragment
 
 object LocationPilothouse {
-  import LocationPilothouseSupport._
-
   sealed abstract class LocationEvent
   case class LocationMessage(location: Location) extends LocationEvent
   case class LocationEnabled(provider: String) extends LocationEvent
@@ -91,7 +89,7 @@ object LocationPilothouse {
     frequencyRequests.values.toSet.foreach {
       (x: UpdateFrequencySpec) =>
         (x, shortestActiveFrequencyRequest) match {
-          case (PassiveUpdates, Some(interval)) if interval <= 2000 =>
+          case (PassiveUpdates, Some(interval)) if interval <= 1000 =>
           // Do nothing, since we're asking for active updates fairly often
 
           case (PassiveUpdates, _) =>
@@ -115,17 +113,12 @@ object LocationPilothouse {
       location <- Option(manager.getLastKnownLocation(provider))
     } yield LocationMessage(location)
 
-  private trait NotifyUsingCallbacksField {
+  private trait NotifyUsingCallbacksField extends HasNotifyWithLocationEventParameter {
     def notifyFn(l: LocationEvent) = callbacks.execute(l)
   }
 
-  private trait EatDuplicateNotifications extends HasNotifyWithLocation {
-    private def locationsMatch(a: Location, b: Location) =
-      a.getTime == b.getTime && a.getProvider == b.getProvider
-
-    private var eatDuplicateNotificationsPreviousNotification: Option[LocationEvent] = None
-
-    abstract override def notifyFn(l: LocationEvent) = {
+  private trait EatDuplicateNotifications extends HasNotifyWithLocationEventParameter {
+    abstract override def notifyFn(l: LocationEvent) =
       (eatDuplicateNotificationsPreviousNotification, l) match {
         case (Some(LocationMessage(previousLocation)), LocationMessage(newLocation)) if locationsMatch(previousLocation, newLocation) =>
         // Do nothing.  We've got a duplicate message
@@ -135,29 +128,16 @@ object LocationPilothouse {
         case _ =>
           super.notifyFn(l)
       }
-    }
+
+    private def locationsMatch(a: Location, b: Location) =
+      a.getTime == b.getTime && a.getProvider == b.getProvider
+
+    private var eatDuplicateNotificationsPreviousNotification: Option[LocationEvent] = None
+
   }
 
   trait HasShouldBeRemovedMethod {
     def shouldBeRemoved: Boolean
-  }
-
-  private trait HasStopMethod extends LocationListenerWithLocationManager {
-    this: LocationListener =>
-    def stop = locationManager.removeUpdates(this)
-  }
-
-  private trait RemoveAfterNCalls extends NotifyUsingCallbacksField {
-    this: LocationListener =>
-    override def notifyFn(l: LocationEvent) = {
-      super.notifyFn(l)
-      currentFetchers dequeueAll {
-        case x: HasShouldBeRemovedMethod with HasStopMethod if x.shouldBeRemoved =>
-          x.stop
-          true
-        case _ => false
-      }
-    }
   }
 
   def stopUpdate(listener: LocationListenerWithLocationManager) = listener.locationManager.removeUpdates(listener)
@@ -236,23 +216,19 @@ object LocationPilothouse {
 
   def removeListeners(owner: AnyRef) = callbacks.remove(owner)
   def removeListener(owner: AnyRef, c: CallbackElement[LocationEvent]) = callbacks.remove(owner, c)
-}
-
-private object LocationPilothouseSupport {
-  import LocationPilothouse._
 
   trait LocationListenerWithLocationManager extends LocationListener {
     def locationManager: LocationManager
   }
 
-  trait HasNotifyWithLocation {
+  trait HasNotifyWithLocationEventParameter {
     def notifyFn(l: LocationEvent)
   }
 
   /**
    * Calls notifyFn on calls to the methods of LocationListener
    */
-  abstract trait NotifyingLocationListener extends LocationListener with HasNotifyWithLocation {
+  trait NotifyingLocationListener extends LocationListener with HasNotifyWithLocationEventParameter {
     abstract override def onLocationChanged(l: Location) = {
       notifyFn(LocationMessage(l))
       super.onLocationChanged(l)
@@ -276,6 +252,24 @@ private object LocationPilothouseSupport {
       } foreach { notifyFn(_) }
 
       super.onStatusChanged(provider, status, extras)
+    }
+  }
+
+  private trait HasStopMethod extends LocationListenerWithLocationManager {
+    this: LocationListener =>
+    def stop = locationManager.removeUpdates(this)
+  }
+
+  private trait RemoveAfterNCalls extends NotifyUsingCallbacksField {
+    //    this: LocationListener =>
+    override def notifyFn(l: LocationEvent) = {
+      super.notifyFn(l)
+      currentFetchers dequeueAll {
+        case x: HasShouldBeRemovedMethod with HasStopMethod if x.shouldBeRemoved =>
+          x.stop
+          true
+        case _ => false
+      }
     }
   }
 
