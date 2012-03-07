@@ -3,5 +3,6 @@
 
     <string name="hello">Hello World, ScalaGpsAndroidActivity!</string>
     <string name="app_name">ScalaGpsAndroid</string>
+    <string name="lorumIpsum">Some text goes here</string>
 
 </resources>

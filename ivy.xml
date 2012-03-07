@@ -19,6 +19,13 @@
     status="integration">
   </info>
   <dependencies>
-   <dependency org="com.google.guava" name="guava" rev="11.0.1"/>
+    <dependency
+      org="com.google.guava"
+      name="guava"
+      rev="11.0.1" />
+    <dependency
+      org="net.sf.proguard"
+      name="proguard-base"
+      rev="4.7" />
   </dependencies>
 </ivy-module>

@@ -2,19 +2,16 @@ package com.restphone.sga
 
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicLong
-
 import scala.Option.option2Iterable
 import scala.PartialFunction.condOpt
 import scala.collection.JavaConversions.asScalaBuffer
 import scala.collection.mutable.SynchronizedMap
 import scala.collection.mutable
-
 import Frequency.ActiveUpdates
 import Frequency.ExistingUpdates
 import Frequency.NoUpdates
 import Frequency.PassiveUpdates
 import Frequency.UpdateFrequencySpec
-import Frequency.frequencyRequests
 import Listeners.startFetchingLocations
 import android.app.Activity
 import android.content.Context
@@ -25,6 +22,7 @@ import android.location.LocationManager
 import android.location.LocationProvider
 import android.os.Bundle
 import android.support.v4.app.Fragment
+import android.app.Service
 
 object Listeners {
   sealed abstract class LocationEvent
@@ -34,6 +32,19 @@ object Listeners {
   case class OutOfService(provider: String) extends LocationEvent
   case class Available(provider: String) extends LocationEvent
   case class TemporarilyUnavailable(provider: String) extends LocationEvent
+
+  def addLocationCallback(owner: AnyRef, fn: LocationEvent => Unit) = {
+    callbacks.add(owner, CallbackElementFunctionWithArgument(fn))
+  }
+  def addLocationCallback(owner: AnyRef, fn: CallbackManager.CallbackWithArgument[LocationEvent]) = {
+    callbacks.add(owner, CallbackElementWithCustomCallback(fn))
+  }
+  def addLocationCallback(owner: AnyRef, fn: CallbackElement[LocationEvent]) = {
+    callbacks.add(owner, fn)
+  }
+
+  def removeLocationCallbacks(owner: AnyRef) = callbacks.remove(owner)
+  def removeLocationCallback(owner: AnyRef, c: CallbackElement[LocationEvent]) = callbacks.remove(owner, c)
 
   private val activeListeners = new mutable.SynchronizedQueue[LocationListenerWithLocationManager]
   private val callbacks = new CallbackManager[AnyRef, LocationEvent]
@@ -46,30 +57,19 @@ object Listeners {
    * @param context
    * @param minTime
    */
-  def resetRequestedUpdates(locationManager: LocationManager, context: Context, minTime: Long) = {
+  def resetRequestedUpdates(locationManager: LocationManager, context: Context) = {
     import Frequency._
 
     stopUpdateAndRemoveAllListenersFromQueue
 
-    val shortestActiveFrequencyRequest = {
-      val items = frequencyRequests.values.toSet
-      val intervals = items.toList flatMap {
-        case ActiveUpdates(i) => Some(i)
-        case _ => None
-      }
-      intervals match {
-        case h :: t => Some(intervals.min)
-        case _ => None
-      }
-    }
-    shortestActiveFrequencyRequest foreach { i => startFetchingLocations(locationManager, context, minTime) }
+    shortestActiveFrequencyRequest foreach { i => startFetchingLocations(locationManager, context, i) }
 
-    frequencyRequests.values.toSet.foreach {
+    activeFrequencyRequests foreach {
       (x: UpdateFrequencySpec) =>
         x match {
           case PassiveUpdates =>
             val listener = createNotifyingListener(locationManager)
-            requestLocationUpdatesAndAddToActiveListeners(locationManager, android.location.LocationManager.PASSIVE_PROVIDER, listener, context, minTime)
+            requestLocationUpdatesAndAddToActiveListeners(locationManager, android.location.LocationManager.PASSIVE_PROVIDER, listener, context, 1000)
 
           case ExistingUpdates =>
             def getLastKnownLocations(manager: LocationManager): Iterable[LocationEvent] =
@@ -177,16 +177,6 @@ object Listeners {
     }
   }
 
-  def addCallback(owner: AnyRef, fn: LocationEvent => Unit) = {
-    callbacks.add(owner, CallbackElementFunctionWithArgument(fn))
-  }
-  def addCallback(owner: AnyRef, fn: CallbackManager.CallbackWithArgument[LocationEvent]) = {
-    callbacks.add(owner, CallbackElementWithCustomCallback(fn))
-  }
-
-  def removeCallbacks(owner: AnyRef) = callbacks.remove(owner)
-  def removeCallback(owner: AnyRef, c: CallbackElement[LocationEvent]) = callbacks.remove(owner, c)
-
   trait CanBeStopped extends LocationListenerWithLocationManager {
     this: LocationListener =>
     def stop = locationManager.removeUpdates(this)
@@ -236,6 +226,7 @@ object Listeners {
     abstract override def onProviderDisabled(provider: String) = {
       notifyFn(LocationDisabled(provider))
       super.onProviderDisabled(provider)
+
     }
 
     abstract override def onProviderEnabled(provider: String) = {
@@ -270,9 +261,22 @@ object Frequency {
   case object ExistingUpdates extends UpdateFrequencySpec
   case object NoUpdates extends UpdateFrequencySpec
 
-  val frequencyRequests = new mutable.WeakHashMap[AnyRef, UpdateFrequencySpec]() with SynchronizedMap[AnyRef, UpdateFrequencySpec]
+  private val frequencyRequests = new mutable.WeakHashMap[AnyRef, Set[UpdateFrequencySpec]]() with SynchronizedMap[AnyRef, Set[UpdateFrequencySpec]]
 
-  def requestUpdateFrequency(owner: AnyRef, frequency: UpdateFrequencySpec) = {
+  def activeFrequencyRequests = {
+    val emptyStartingValue = Set.empty[UpdateFrequencySpec]
+    frequencyRequests.values.foldLeft(emptyStartingValue)((memo, obj) => memo ++ obj)
+  }
+
+  def shortestActiveFrequencyRequest = {
+    val intervals = Frequency.activeFrequencyRequests collect {
+      case ActiveUpdates(i) => i
+    }
+    if (intervals.size > 0) Some(intervals.min)
+    else None
+  }
+
+  def requestUpdateFrequency(owner: AnyRef, frequency: Set[UpdateFrequencySpec]) = {
     frequencyRequests.put(owner, frequency)
   }
 }
@@ -281,23 +285,49 @@ object AndroidInteractions {
   import Listeners._
 
   trait StartLocationFeed {
-    def locationFeedActivity: Activity
-    def locationFeedLocationManager: LocationManager = locationFeedActivity.getSystemService(Context.LOCATION_SERVICE).asInstanceOf[LocationManager]
-    def locationFeedApplicationContext: Context = locationFeedActivity.getApplicationContext
-    def baseOnResume = startFetchingLocations(locationFeedLocationManager,
-      locationFeedApplicationContext, 0);
-    def baseOnPause = {}
+    def locationFeedLocationManager: LocationManager
+    def locationFeedApplicationContext: Context
+
+    def locationUpdateFrequency: Set[UpdateFrequencySpec] = Set(PassiveUpdates)
+    def onLocationEvent(locationEvent: LocationEvent) = {}
+    val locationFeedDefaultCallbacks: Iterable[CallbackElement[LocationEvent]] = List(CallbackElementFunctionWithArgument(onLocationEvent))
+    def baseOnResume = {
+      locationFeedDefaultCallbacks foreach { addLocationCallback(this, _) }
+      Frequency.requestUpdateFrequency(this, locationUpdateFrequency)
+      resetRequestedUpdates(locationFeedLocationManager, locationFeedApplicationContext)
+    }
+    def baseOnPause = {
+      locationFeedDefaultCallbacks foreach { removeLocationCallback(this, _) }
+      Frequency.requestUpdateFrequency(this, Set(NoUpdates))
+    }
   }
 
   trait StartLocationFeedForActivity extends Activity with StartLocationFeed {
-    def locationFeedActivity = this
+    def locationFeedLocationManager = this.getSystemService(Context.LOCATION_SERVICE).asInstanceOf[LocationManager]
+    def locationFeedApplicationContext: Context = this.getApplicationContext
     abstract override def onResume = { baseOnResume; super.onResume }
     abstract override def onPause = { baseOnPause; super.onPause }
   }
 
   trait StartLocationFeedForFragment extends Fragment with StartLocationFeed {
-    def locationFeedActivity = getActivity
+    def locationFeedLocationManager = this.getActivity.getSystemService(Context.LOCATION_SERVICE).asInstanceOf[LocationManager]
+    def locationFeedApplicationContext: Context = this.getActivity.getApplicationContext
     abstract override def onResume = { baseOnResume; super.onResume }
     abstract override def onPause = { baseOnPause; super.onPause }
+  }
+
+  trait StartLocationFeedForService extends Service with StartLocationFeed {
+    def locationFeedLocationManager = this.getSystemService(Context.LOCATION_SERVICE).asInstanceOf[LocationManager]
+    def locationFeedApplicationContext: Context = this.getApplicationContext
+    abstract override def onCreate = { baseOnResume; super.onCreate }
+    abstract override def onDestroy = { baseOnPause; super.onDestroy }
+  }
+
+  trait LocationFeedConstantUpdates extends StartLocationFeed {
+    override def locationUpdateFrequency = super.locationUpdateFrequency ++ Set(ActiveUpdates(5000))
+  }
+
+  trait LocationFeedExistingLocations extends StartLocationFeed {
+    override def locationUpdateFrequency = super.locationUpdateFrequency ++ Set(ExistingUpdates)
   }
 }
