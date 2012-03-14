@@ -3,7 +3,7 @@ package com.restphone.sga
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicLong
 import scala.Option.option2Iterable
-import scala.PartialFunction.condOpt
+import scala.PartialFunction._
 import scala.collection.JavaConversions.asScalaBuffer
 import scala.collection.mutable.SynchronizedMap
 import scala.collection.mutable
@@ -12,7 +12,6 @@ import Frequency.ExistingUpdates
 import Frequency.NoUpdates
 import Frequency.PassiveUpdates
 import Frequency.UpdateFrequencySpec
-import Listeners.startFetchingLocations
 import android.app.Activity
 import android.content.Context
 import android.location.LocationListener
@@ -24,7 +23,35 @@ import android.os.Bundle
 import android.support.v4.app.Fragment
 import android.app.Service
 
-object Listeners {
+/**
+ * Location mixin traits for Android services, applications and fragments.
+ *
+ * Summary: mix in these traits to your service, application, activity or fragment, and
+ * your onLocationEvent method will get called when your location changes.
+ *
+ * When you mix in the appropriate trait to your service, application or fragment,
+ * your onLocationEvent is called with a LocationEvent parameter.  The defaults attach to
+ * Android location services at the appropriate places in their lifecycles.  For activities and
+ * fragments, that happens in the overridden onResume and onPause calls.
+ *
+ * Multiple objects can mix in these traits.  You can have a service and two fragments all
+ * request location events, and the system will set the update frequencies equal to the
+ * most aggressive.  That enables doing things like having a service ask for passive updates,
+ * one fragment ask for updates every second, and another ask for once a minute.  As long as
+ * the fragments are active, everyone will see the one-second updates.  When another activity
+ * comes to the foreground, the requests for active updates will be stopped but the
+ * service will continue to receive passive updates.
+ */
+object LocationListeners {
+  import ListenerLifecycle._
+
+  // Listers are attached to Android location managers.  When location managers call
+  // the lister callbacks, the right LocationEvent is created and sent to registered
+  // callbacks.
+
+  /**
+   * Events for valid locations and location statuses, including availabilty and service.
+   */
   sealed abstract class LocationEvent
   case class LocationMessage(location: Location) extends LocationEvent
   case class LocationEnabled(provider: String) extends LocationEvent
@@ -33,26 +60,21 @@ object Listeners {
   case class Available(provider: String) extends LocationEvent
   case class TemporarilyUnavailable(provider: String) extends LocationEvent
 
-  def addLocationCallback(owner: AnyRef, fn: LocationEvent => Unit) = {
-    callbacks.add(owner, CallbackElementFunctionWithArgument(fn))
-  }
-  def addLocationCallback(owner: AnyRef, fn: CallbackManager.CallbackWithArgument[LocationEvent]) = {
-    callbacks.add(owner, CallbackElementWithCustomCallback(fn))
-  }
-  def addLocationCallback(owner: AnyRef, fn: CallbackElement[LocationEvent]) = {
+  // Objects interested in receiving LocationEvent messages register callbacks using 
+  // the addLocationCallback methods and remove them using the removeLocationCallbacks
+  // methods.
+  def addLocationCallback(owner: AnyRef, fn: callbacks.Callable) = {
     callbacks.add(owner, fn)
   }
 
-  def removeLocationCallbacks(owner: AnyRef) = callbacks.remove(owner)
-  def removeLocationCallback(owner: AnyRef, c: CallbackElement[LocationEvent]) = callbacks.remove(owner, c)
-
-  private val activeListeners = new mutable.SynchronizedQueue[LocationListenerWithLocationManager]
   private val callbacks = new CallbackManager[AnyRef, LocationEvent]
 
   /**
-   * Notice that there's a difference between listeners and callbacks.  Listeners are hooked up to
-   * location manager updates, and they forward location events to callbacks.
-   * Callbacks aren't affected by this method.
+   * Removes the curret set of listeners, then uses the active requests to calculate which
+   * listeners should be attached to location providers.
+   *
+   * While we could keep track of the existing providers and only apply changes, it doesn't
+   * seem worthwhile.
    * @param locationManager
    * @param context
    * @param minTime
@@ -60,150 +82,107 @@ object Listeners {
   def resetRequestedUpdates(locationManager: LocationManager, context: Context) = {
     import Frequency._
 
-    stopUpdateAndRemoveAllListenersFromQueue
+    stopUpdateAndRemoveListenersFromQueue
 
-    shortestActiveFrequencyRequest foreach { i => startFetchingLocations(locationManager, context, i) }
+    for {
+      frequency <- shortestActiveFrequencyRequest
+      provider <- locationManager.getAllProviders
+    } {
+      addListener(locationManager, provider, context, frequency)
+    }
+    shortestPassiveFrequencyRequest foreach {
+      i =>
+        addListener(locationManager, LocationManager.PASSIVE_PROVIDER, context, i)
+    }
 
-    activeFrequencyRequests foreach {
-      (x: UpdateFrequencySpec) =>
-        x match {
-          case PassiveUpdates =>
-            val listener = createNotifyingListener(locationManager)
-            requestLocationUpdatesAndAddToActiveListeners(locationManager, android.location.LocationManager.PASSIVE_PROVIDER, listener, context, 1000)
+    activeFrequencyRequests collect {
+      case ExistingUpdates =>
+        def getLastKnownLocations(manager: LocationManager): Iterable[LocationEvent] =
+          for {
+            provider <- manager.getAllProviders
+            location <- Option(manager.getLastKnownLocation(provider))
+          } yield LocationMessage(location)
+        getLastKnownLocations(locationManager) foreach callbacks.execute
+    }
+  }
 
-          case ExistingUpdates =>
-            def getLastKnownLocations(manager: LocationManager): Iterable[LocationEvent] =
-              for {
-                provider <- manager.getAllProviders
-                location <- Option(manager.getLastKnownLocation(provider))
-              } yield LocationMessage(location)
-            getLastKnownLocations(locationManager) foreach callbacks.execute
+  object ListenerLifecycle {
+    def addListener(locationManager: LocationManager, provider: String, context: Context, minTime: Long) = {
+      val listener = createNotifyingListener(locationManager)
+      requestLocationUpdatesAndAddToActiveListeners(locationManager, provider, listener, context, minTime)
+    }
 
-          case ActiveUpdates(_) =>
-          // Already handled by currentFrequencyRequest
+    /**
+     * A limited listener attaches to the best provider and only executes once.
+     * @param locationManager
+     * @param criteria
+     * @param context
+     */
+    def addLimitedListener(locationManager: LocationManager, criteria: Criteria, context: Context) {
+      Option(locationManager.getBestProvider(criteria, true)) foreach {
+        provider =>
+          val listener = createLimitedListener(locationManager, 1)
+          requestLocationUpdatesAndAddToActiveListeners(locationManager, provider, listener, context, 0)
+      }
+    }
 
-          case NoUpdates =>
+    def stopUpdateAndRemoveListenersFromQueue = {
+      def stopUpdate(listener: LocationListenerWithLocationManager) = { listener.locationManager.removeUpdates(listener); listener }
+      activeListeners --= activeListeners map stopUpdate
+    }
+
+    def stopDeadListenersAndRemoveFromQueue = {
+      val stoppedListeners = activeListeners collect canAndShouldBeStopped map { _.stop }
+      activeListeners --= stoppedListeners
+    }
+
+    private[this] val activeListeners = mutable.Buffer.empty[LocationListenerWithLocationManager]
+
+    private[this] def requestLocationUpdatesAndAddToActiveListeners(locationManager: LocationManager, provider: String, listener: LocationListenerWithLocationManager, context: Context, minTime: Long) {
+      activeListeners += listener
+      locationManager.requestLocationUpdates(provider, minTime, 0, listener, context.getMainLooper)
+    }
+
+    private[this] def createNotifyingListener(lm: LocationManager): LocationListenerWithLocationManager =
+      new BaseLocationListener with LocationListenerWithLocationManager with NotifyingLocationListener with NotifyUsingCallbacksField {
+        override val locationManager = lm
+      }
+
+    /**
+     * Creates a LocationListener that disconnects itself after receiving {@code nExecutions} {@code LocationMessage}s.
+     * @param locationManager
+     * @param nExecutions
+     * @return
+     */
+    private[this] def createLimitedListener(locationManager: LocationManager, nExecutions: Long): LocationListenerWithLocationManager = {
+      val count = new AtomicLong(0)
+      val parentLocationManager = locationManager
+      new BaseLocationListener with NotifyingLocationListener with NotifyUsingCallbacksField with CanBeStopped with LocationListenerWithLocationManager {
+        val locationManager = parentLocationManager
+        def shouldBeStopped = (count.get >= nExecutions)
+        override def notifyFn(l: LocationEvent) = {
+          (l, count.get) match {
+            case (LocationMessage(_), n) if n < nExecutions =>
+              count.incrementAndGet
+              super.notifyFn(l)
+            case _ =>
+          }
         }
-    }
-  }
-
-  def startFetchingLocations(locationManager: LocationManager, context: Context, minTime: Long, specificProvider: Option[String] = None) {
-    val providers: Iterable[String] = specificProvider match {
-      case Some(p) => Iterable(p)
-      case None => locationManager.getAllProviders
-    }
-    providers foreach {
-      provider =>
-        val listener = createNotifyingListener(locationManager)
-        requestLocationUpdatesAndAddToActiveListeners(locationManager, provider, listener, context, minTime)
-    }
-  }
-
-  def requestLocationUpdatesAndAddToActiveListeners(locationManager: LocationManager, provider: String, listener: LocationListenerWithLocationManager, context: Context, minTime: Long) {
-    activeListeners += listener
-    locationManager.requestLocationUpdates(provider, minTime, 0, listener, context.getMainLooper)
-  }
-
-  def stopUpdateAndRemoveAllListenersFromQueue = {
-    def stopUpdateAndRemoveFromQueue(listeners: List[LocationListenerWithLocationManager]) = {
-      def stopUpdate(listener: LocationListenerWithLocationManager) = listener.locationManager.removeUpdates(listener)
-      activeListeners dequeueAll listeners.contains
-      listeners foreach stopUpdate
-    }
-    stopUpdateAndRemoveFromQueue(activeListeners.toList)
-  }
-
-  def createNotifyingListener(lm: LocationManager): LocationListenerWithLocationManager =
-    new BaseLocationListener with LocationListenerWithLocationManager with NotifyingLocationListener with NotifyUsingCallbacksField with RemoveAfterNEvents with EatDuplicateNotifications {
-      override val locationManager = lm
-    }
-
-  /**
-   * Creates a LocationListener that disconnects itself after receiving {@code nExecutions} {@code LocationMessage}s.
-   * @param locationManager
-   * @param nExecutions
-   * @return
-   */
-  private def createRemovableListener(locationManager: LocationManager, nExecutions: Long): LocationListenerWithLocationManager = {
-    val count = new AtomicLong(0)
-    val locationManager2 = locationManager
-    new BaseLocationListener with NotifyingLocationListener with NotifyUsingCallbacksField with CanBeStopped with LocationListenerWithLocationManager {
-      val locationManager = locationManager2
-      def shouldBeRemoved = {
-        (count.get >= nExecutions)
-      }
-      override def notifyFn(l: LocationEvent) = {
-        super.notifyFn(l)
-        l match {
-          case LocationMessage(_) => count.incrementAndGet
-          case _ =>
-        }
       }
     }
   }
 
-  def fetchSingleLocation(locationManager: LocationManager, criteria: Criteria, context: Context) {
-    Option(locationManager.getBestProvider(criteria, true)) foreach {
-      provider =>
-        val listener = createRemovableListener(locationManager, 1)
-        requestLocationUpdatesAndAddToActiveListeners(locationManager, provider, listener, context, 0)
-    }
-  }
-
-  /**
-   * Returns true if the location given is equivalent to the previous location given.
-   * Saves the location given and will use it for the next run.
-   * Returns false on the first run.
-   * Any event other than LocationMessage(_) returns false and is not saved.
-   *
-   * Equivalence is defined in the {@code locationsMatch} method.
-   */
-  private val locationIsARepeat = {
-    def locationsMatch(a: Location, b: Location) =
-      a.getTime == b.getTime && a.getAccuracy == b.getAccuracy
-
-    val eatDuplicateNotificationsPreviousNotification: AtomicReference[LocationEvent] = new AtomicReference(null)
-
-    (l: LocationEvent) => eatDuplicateNotificationsPreviousNotification.synchronized {
-      (eatDuplicateNotificationsPreviousNotification.get, l) match {
-        case (LocationMessage(previousLocation), LocationMessage(newLocation)) if locationsMatch(previousLocation, newLocation) =>
-          true
-        case (_, LocationMessage(_)) =>
-          eatDuplicateNotificationsPreviousNotification.set(l)
-          false
-        case _ =>
-          false
-      }
-    }
+  def canAndShouldBeStopped: PartialFunction[LocationListenerWithLocationManager, CanBeStopped] = {
+    case x: CanBeStopped if x.shouldBeStopped => x
   }
 
   trait CanBeStopped extends LocationListenerWithLocationManager {
-    this: LocationListener =>
-    def stop = locationManager.removeUpdates(this)
-    def shouldBeRemoved: Boolean
+    def stop = { locationManager.removeUpdates(this); this }
+    def shouldBeStopped: Boolean
   }
 
   trait NotifyUsingCallbacksField extends HasNotifyWithLocationEventParameter {
     def notifyFn(l: LocationEvent) = callbacks.execute(l)
-  }
-
-  trait EatDuplicateNotifications extends HasNotifyWithLocationEventParameter {
-    abstract override def notifyFn(l: LocationEvent) = {
-      if (!locationIsARepeat(l))
-        super.notifyFn(l)
-    }
-  }
-
-  trait RemoveAfterNEvents extends HasNotifyWithLocationEventParameter {
-    abstract override def notifyFn(l: LocationEvent) = {
-      super.notifyFn(l)
-      activeListeners dequeueAll {
-        case x: CanBeStopped if x.shouldBeRemoved =>
-          x.stop
-          true
-        case _ => false
-      }
-    }
   }
 
   trait LocationListenerWithLocationManager extends LocationListener {
@@ -257,47 +236,61 @@ object Listeners {
 object Frequency {
   sealed abstract class UpdateFrequencySpec
   case class ActiveUpdates(interval: Int) extends UpdateFrequencySpec
-  case object PassiveUpdates extends UpdateFrequencySpec
+  case class PassiveUpdates(interval: Int) extends UpdateFrequencySpec
   case object ExistingUpdates extends UpdateFrequencySpec
   case object NoUpdates extends UpdateFrequencySpec
 
-  private val frequencyRequests = new mutable.WeakHashMap[AnyRef, Set[UpdateFrequencySpec]]() with SynchronizedMap[AnyRef, Set[UpdateFrequencySpec]]
+  def requestUpdateFrequency(owner: AnyRef, frequency: Set[UpdateFrequencySpec]) = {
+    frequencyRequests.put(owner, frequency)
+  }
+
+  def shortestActiveFrequencyRequest: Option[Int] = shortestRequest(activeFrequencyRequestValues)
+  def shortestPassiveFrequencyRequest: Option[Int] = shortestRequest(passiveFrequencyRequestValues)
 
   def activeFrequencyRequests = {
     val emptyStartingValue = Set.empty[UpdateFrequencySpec]
     frequencyRequests.values.foldLeft(emptyStartingValue)((memo, obj) => memo ++ obj)
   }
 
-  def shortestActiveFrequencyRequest = {
-    val intervals = Frequency.activeFrequencyRequests collect {
-      case ActiveUpdates(i) => i
-    }
-    if (intervals.size > 0) Some(intervals.min)
-    else None
+  private val activeFrequencyRequestValues: PartialFunction[UpdateFrequencySpec, Int] = {
+    case ActiveUpdates(i) => i
   }
 
-  def requestUpdateFrequency(owner: AnyRef, frequency: Set[UpdateFrequencySpec]) = {
-    frequencyRequests.put(owner, frequency)
+  private val passiveFrequencyRequestValues: PartialFunction[UpdateFrequencySpec, Int] = {
+    case PassiveUpdates(i) => i
   }
+
+  private def shortestRequest(converter: PartialFunction[UpdateFrequencySpec, Int]): Option[Int] = {
+    def optionalMin(xs: Iterable[Int]): Option[Int] = {
+      if (xs.isEmpty) None
+      else Some(xs.min)
+    }
+    val intervals = Frequency.activeFrequencyRequests collect converter
+    optionalMin(intervals)
+  }
+
+  private val frequencyRequests = new mutable.WeakHashMap[AnyRef, Set[UpdateFrequencySpec]]() with SynchronizedMap[AnyRef, Set[UpdateFrequencySpec]]
+
 }
 
-object AndroidInteractions {
-  import Listeners._
+object LocationListenerMixins {
+  import LocationListeners._
 
   trait StartLocationFeed {
     def locationFeedLocationManager: LocationManager
     def locationFeedApplicationContext: Context
 
-    def locationUpdateFrequency: Set[UpdateFrequencySpec] = Set(PassiveUpdates)
+    def locationUpdateFrequency: Set[UpdateFrequencySpec] = Set(PassiveUpdates(0))
     def onLocationEvent(locationEvent: LocationEvent) = {}
-    val locationFeedDefaultCallbacks: Iterable[CallbackElement[LocationEvent]] = List(CallbackElementFunctionWithArgument(onLocationEvent))
+    val locationFeedDefaultCallbacks = List(onLocationEvent(_))
+    var callbackDisposals: Iterable[CallbackToken] = List.empty
     def baseOnResume = {
-      locationFeedDefaultCallbacks foreach { addLocationCallback(this, _) }
+      callbackDisposals = locationFeedDefaultCallbacks map { addLocationCallback(this, _) }
       Frequency.requestUpdateFrequency(this, locationUpdateFrequency)
       resetRequestedUpdates(locationFeedLocationManager, locationFeedApplicationContext)
     }
     def baseOnPause = {
-      locationFeedDefaultCallbacks foreach { removeLocationCallback(this, _) }
+      callbackDisposals foreach { _.dispose }
       Frequency.requestUpdateFrequency(this, Set(NoUpdates))
     }
   }

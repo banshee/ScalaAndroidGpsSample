@@ -1,14 +1,13 @@
 package com.restphone.sga
 
-import com.restphone.sga.CallbackManager.CallbackWithArgument
+import com.restphone.sga.LocationListeners._
+import com.restphone.sga.LocationListenerMixins._
 import android.app.Activity
 import android.content.Context
 import android.location.LocationManager
 import android.os.Bundle
 import android.support.v4.app.FragmentActivity
 import android.support.v4.app.Fragment
-import com.restphone.sga.AndroidInteractions._
-import com.restphone.sga.Listeners._
 import android.widget.EditText
 import android.view.LayoutInflater
 import android.view.ViewGroup
@@ -29,7 +28,7 @@ class ScalaGpsAndroidActivity extends FragmentActivity with StartLocationFeedFor
     val f = new SimpleLocationDisplay
     fragmentTransaction.add(R.id.mainContainer, f)
     fragmentTransaction.commit
-    
+
     val i = (new Intent).setClass(getApplicationContext, classOf[SimpleService])
     startService(i)
   }
