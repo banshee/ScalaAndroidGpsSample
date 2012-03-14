@@ -127,7 +127,7 @@ object LocationListeners {
     }
 
     def stopUpdateAndRemoveListenersFromQueue = {
-      def stopUpdate(listener: LocationListenerWithLocationManager) = { listener.locationManager.removeUpdates(listener); listener }
+      def stopUpdate(listener: NotifyingLocationListener) = { listener.locationManager.removeUpdates(listener); listener }
       activeListeners --= activeListeners map stopUpdate
     }
 
@@ -136,15 +136,15 @@ object LocationListeners {
       activeListeners --= stoppedListeners
     }
 
-    private[this] val activeListeners = mutable.Buffer.empty[LocationListenerWithLocationManager]
+    private[this] val activeListeners = mutable.Buffer.empty[NotifyingLocationListener]
 
-    private[this] def requestLocationUpdatesAndAddToActiveListeners(locationManager: LocationManager, provider: String, listener: LocationListenerWithLocationManager, context: Context, minTime: Long) {
+    private[this] def requestLocationUpdatesAndAddToActiveListeners(locationManager: LocationManager, provider: String, listener: NotifyingLocationListener, context: Context, minTime: Long) {
       activeListeners += listener
       locationManager.requestLocationUpdates(provider, minTime, 0, listener, context.getMainLooper)
     }
 
-    private[this] def createNotifyingListener(lm: LocationManager): LocationListenerWithLocationManager =
-      new BaseLocationListener with LocationListenerWithLocationManager with NotifyingLocationListener with NotifyUsingCallbacksField {
+    private[this] def createNotifyingListener(lm: LocationManager): NotifyingLocationListener =
+      new BaseLocationListener with NotifyingLocationListener {
         override val locationManager = lm
       }
 
@@ -154,10 +154,10 @@ object LocationListeners {
      * @param nExecutions
      * @return
      */
-    private[this] def createLimitedListener(locationManager: LocationManager, nExecutions: Long): LocationListenerWithLocationManager = {
+    private[this] def createLimitedListener(locationManager: LocationManager, nExecutions: Long): NotifyingLocationListener = {
       val count = new AtomicLong(0)
       val parentLocationManager = locationManager
-      new BaseLocationListener with NotifyingLocationListener with NotifyUsingCallbacksField with CanBeStopped with LocationListenerWithLocationManager {
+      new BaseLocationListener with CanBeStopped with NotifyingLocationListener {
         val locationManager = parentLocationManager
         def shouldBeStopped = (count.get >= nExecutions)
         override def notifyFn(l: LocationEvent) = {
@@ -172,31 +172,22 @@ object LocationListeners {
     }
   }
 
-  def canAndShouldBeStopped: PartialFunction[LocationListenerWithLocationManager, CanBeStopped] = {
+  def canAndShouldBeStopped: PartialFunction[NotifyingLocationListener, CanBeStopped] = {
     case x: CanBeStopped if x.shouldBeStopped => x
   }
 
-  trait CanBeStopped extends LocationListenerWithLocationManager {
+  trait CanBeStopped extends NotifyingLocationListener {
     def stop = { locationManager.removeUpdates(this); this }
     def shouldBeStopped: Boolean
-  }
-
-  trait NotifyUsingCallbacksField extends HasNotifyWithLocationEventParameter {
-    def notifyFn(l: LocationEvent) = callbacks.execute(l)
-  }
-
-  trait LocationListenerWithLocationManager extends LocationListener {
-    def locationManager: LocationManager
-  }
-
-  trait HasNotifyWithLocationEventParameter {
-    def notifyFn(l: LocationEvent)
   }
 
   /**
    * Calls notifyFn on calls to the methods of LocationListener
    */
-  trait NotifyingLocationListener extends LocationListener with HasNotifyWithLocationEventParameter {
+  trait NotifyingLocationListener extends LocationListener {
+    def notifyFn(l: LocationEvent) = callbacks.execute(l)
+    def locationManager: LocationManager
+
     abstract override def onLocationChanged(l: Location) = {
       notifyFn(LocationMessage(l))
       super.onLocationChanged(l)
