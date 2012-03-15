@@ -131,11 +131,6 @@ object LocationListeners {
       activeListeners --= activeListeners map stopUpdate
     }
 
-    def stopDeadListenersAndRemoveFromQueue = {
-      val stoppedListeners = activeListeners collect canAndShouldBeStopped map { _.stop }
-      activeListeners --= stoppedListeners
-    }
-
     private[this] val activeListeners = mutable.Buffer.empty[NotifyingLocationListener]
 
     private[this] def requestLocationUpdatesAndAddToActiveListeners(locationManager: LocationManager, provider: String, listener: NotifyingLocationListener, context: Context, minTime: Long) {
@@ -157,14 +152,15 @@ object LocationListeners {
     private[this] def createLimitedListener(locationManager: LocationManager, nExecutions: Long): NotifyingLocationListener = {
       val count = new AtomicLong(0)
       val parentLocationManager = locationManager
-      new BaseLocationListener with CanBeStopped with NotifyingLocationListener {
+      new BaseLocationListener with NotifyingLocationListener {
         val locationManager = parentLocationManager
-        def shouldBeStopped = (count.get >= nExecutions)
         override def notifyFn(l: LocationEvent) = {
           (l, count.get) match {
             case (LocationMessage(_), n) if n < nExecutions =>
               count.incrementAndGet
               super.notifyFn(l)
+            case (LocationMessage(_), n) =>
+              stop
             case _ =>
           }
         }
@@ -172,21 +168,14 @@ object LocationListeners {
     }
   }
 
-  def canAndShouldBeStopped: PartialFunction[NotifyingLocationListener, CanBeStopped] = {
-    case x: CanBeStopped if x.shouldBeStopped => x
-  }
-
-  trait CanBeStopped extends NotifyingLocationListener {
-    def stop = { locationManager.removeUpdates(this); this }
-    def shouldBeStopped: Boolean
-  }
-
   /**
    * Calls notifyFn on calls to the methods of LocationListener
    */
   trait NotifyingLocationListener extends LocationListener {
     def notifyFn(l: LocationEvent) = callbacks.execute(l)
+
     def locationManager: LocationManager
+    def stop = { locationManager.removeUpdates(this); this }
 
     abstract override def onLocationChanged(l: Location) = {
       notifyFn(LocationMessage(l))
